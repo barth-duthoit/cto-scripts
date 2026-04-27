@@ -1,8 +1,7 @@
-"""Notion getTopEntitiesByUsage — ``NOTION_COOKIE`` from ``.env``; space/active user hardcoded."""
+"""Notion getTopEntitiesByUsage — ``NOTION_COOKIE`` from ``.env``; tabular output on stdout."""
 
 from __future__ import annotations
 
-import json
 import sys
 from datetime import datetime, timezone
 from typing import Any
@@ -21,7 +20,7 @@ NOTION_CLIENT_VERSION = "23.13.20260427.0804"
 _SERVICE_PERIOD_ANCHOR_DAY = 22
 
 TOP_ENTITIES_URL = "https://www.notion.so/api/v3/getTopEntitiesByUsage"
-TOP_ENTITIES_LIMIT = 50
+TOP_ENTITIES_LIMIT = 500
 
 _BAGGAGE = (
     "sentry-environment=production,"
@@ -134,7 +133,16 @@ def main() -> int:
         print(str(e), file=sys.stderr)
         return 1
 
-    print(json.dumps(data, indent=2, ensure_ascii=False))
+    from notion_ai_usage.databricks_job import print_tabular, usage_response_to_rows
+
+    rows = usage_response_to_rows(
+        data,
+        space_id=NOTION_SPACE_ID,
+        service_period_start_ms=ps,
+        service_period_end_ms=pe,
+        ingested_at=datetime.now(timezone.utc),
+    )
+    print_tabular(rows)
     return 0
 
 

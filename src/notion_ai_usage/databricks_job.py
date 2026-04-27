@@ -1,16 +1,20 @@
-"""Databricks Job entry: fetch usage → Delta table.
+"""Databricks Job entry: fetch usage → tabular rows → Delta table.
 
 Configure the Job environment (or cluster env) with:
 
-- ``NOTION_COOKIE`` — browser session cookie (inject from Secrets, e.g.
-  ``{{secrets/cto-notion/notion-cookie}}`` where your workspace supports it).
-- ``NOTION_AI_DELTA_TABLE`` — Unity Catalog table name, e.g.
+- ``NOTION_COOKIE`` — browser cookie string **or** leave unset and use
+  ``DATABRICKS_SECRET_SCOPE`` + ``DATABRICKS_SECRET_KEY_NOTION_COOKIE`` so the job
+  loads it via ``dbutils.secrets`` (see ``notion_ai_usage.databricks_secrets``).
+- ``NOTION_AI_DELTA_TABLE`` — Unity Catalog table name for **tabular** storage (rows/columns), e.g.
   ``main.analytics.notion_ai_usage_top_entities``. Omit or leave empty to skip Delta.
+- ``NOTION_AI_CSV_PATH`` — optional: export the same table to a **comma-separated file** (for Excel
+  etc.). Tabular data itself is not “CSV-specific”; it is the flattened DataFrame / Delta rows.
 
 Requires a Databricks Runtime with Delta Lake and PySpark (standard).
 
-Flattening uses ``pandas.json_normalize`` on extracted entity records (see
-``usage_response_to_rows``).
+Rows are ``pandas.json_normalize`` output plus a few run-metadata columns (see
+``usage_response_to_rows``). Nested keys become dotted names, then dots are
+replaced with underscores for Delta-friendly columns.
 """
 
 from __future__ import annotations
@@ -20,11 +24,12 @@ import os
 import sys
 import traceback
 from datetime import datetime, timezone
-from typing import Any
+from typing import IO, Any, TextIO
 
 import pandas as pd
 from pydantic import ValidationError
 
+from notion_ai_usage.databricks_secrets import hydrate_notion_cookie_from_databricks_secrets
 from notion_ai_usage.env import NotionCookieEnv
 from notion_ai_usage.top_entities import (
     NOTION_SPACE_ID,
@@ -67,22 +72,11 @@ def _extract_entity_list(data: Any) -> list[Any]:
     return []
 
 
-def _ensure_alias(
-    df: pd.DataFrame,
-    target: str,
-    candidates: tuple[str, ...],
-) -> None:
-    if target in df.columns:
-        return
-    for c in candidates:
-        if c in df.columns:
-            df[target] = df[c]
-            return
-    for col in df.columns:
-        leaf = col.rsplit(".", 1)[-1]
-        if leaf in candidates:
-            df[target] = df[col]
-            return
+def _tabular_frame(df: pd.DataFrame) -> pd.DataFrame:
+    """Flat column names (no dots) for Spark / SQL."""
+    df = df.copy()
+    df.columns = [str(c).replace(".", "_") for c in df.columns]
+    return df
 
 
 def usage_response_to_rows(
@@ -93,50 +87,71 @@ def usage_response_to_rows(
     service_period_end_ms: int,
     ingested_at: datetime | None = None,
 ) -> list[dict[str, Any]]:
-    """Flatten API JSON with ``pandas.json_normalize`` for Delta."""
+    """One row per entity: normalized fields + metadata. Fallback: single row with ``response_json``."""
     ts = ingested_at or datetime.now(timezone.utc)
     ingested_iso = ts.isoformat()
 
     items = _extract_entity_list(response)
     if not items:
-        return [
-            {
-                "ingested_at": ingested_iso,
-                "space_id": space_id,
-                "service_period_start_ms": service_period_start_ms,
-                "service_period_end_ms": service_period_end_ms,
-                "entity_index": -1,
-                "entity_id": None,
-                "title": None,
-                "usage": None,
-                "entity_json": json.dumps(response, ensure_ascii=False),
-                "parse_note": "no_entity_list_fallback_raw_response",
-            }
-        ]
+        df = pd.DataFrame(
+            [
+                {
+                    "ingested_at": ingested_iso,
+                    "space_id": space_id,
+                    "service_period_start_ms": service_period_start_ms,
+                    "service_period_end_ms": service_period_end_ms,
+                    "entity_index": -1,
+                    "response_json": json.dumps(response, ensure_ascii=False),
+                }
+            ]
+        )
+        return json.loads(df.to_json(orient="records", date_format="iso"))
 
-    df = pd.json_normalize(items)
+    df = _tabular_frame(pd.json_normalize(items))
     df["entity_index"] = range(len(df))
     df["ingested_at"] = ingested_iso
     df["space_id"] = space_id
     df["service_period_start_ms"] = service_period_start_ms
     df["service_period_end_ms"] = service_period_end_ms
-    df["entity_json"] = [json.dumps(x, ensure_ascii=False) for x in items]
-    df["parse_note"] = None
-
-    _ensure_alias(
-        df,
-        "title",
-        ("title", "name", "workflowName", "displayName", "label"),
+    meta = (
+        "ingested_at",
+        "space_id",
+        "service_period_start_ms",
+        "service_period_end_ms",
+        "entity_index",
     )
-    _ensure_alias(
-        df,
-        "usage",
-        ("usage", "totalUsage", "credits", "meteredUsage", "aggregateUsage", "count"),
-    )
-    _ensure_alias(df, "entity_id", ("id", "workflowId", "entityId", "blockId"))
+    rest = [c for c in df.columns if c not in meta]
+    df = df[list(meta) + rest]
 
-    # JSON round-trip yields native Python types for Spark / APIs.
     return json.loads(df.to_json(orient="records", date_format="iso"))
+
+
+def print_tabular(
+    rows: list[dict[str, Any]],
+    *,
+    file: TextIO | None = None,
+) -> None:
+    """Print rows as an aligned text table (tabular), not comma-separated."""
+    out = file if file is not None else sys.stdout
+    if not rows:
+        print("(no rows)", file=out)
+        return
+    df = pd.DataFrame(rows)
+    with pd.option_context(
+        "display.max_columns", None,
+        "display.max_rows", None,
+        "display.width", None,
+        "display.max_colwidth", 72,
+    ):
+        print(df.to_string(index=False), file=out)
+
+
+def write_csv_rows(
+    rows: list[dict[str, Any]],
+    path_or_buf: str | os.PathLike[str] | IO[str],
+) -> None:
+    """Optional comma-separated export (UTF-8, no index). Prefer ``print_tabular`` for CLI viewing."""
+    pd.DataFrame(rows).to_csv(path_or_buf, index=False)
 
 
 def write_delta_append(rows: list[dict[str, object]], table_name: str) -> None:
@@ -152,13 +167,17 @@ def write_delta_append(rows: list[dict[str, object]], table_name: str) -> None:
 
 def run_pipeline() -> int:
     delta_table = os.environ.get("NOTION_AI_DELTA_TABLE", "").strip()
+    csv_path = os.environ.get("NOTION_AI_CSV_PATH", "").strip()
+
+    hydrate_notion_cookie_from_databricks_secrets()
 
     try:
         cookie_env = NotionCookieEnv()
     except ValidationError as e:
         _stderr(
-            "Missing NOTION_COOKIE. Set it in the Job environment "
-            "(e.g. from Databricks Secrets).\n"
+            "Missing NOTION_COOKIE. Set NOTION_COOKIE on the job/cluster, "
+            "or DATABRICKS_SECRET_SCOPE + DATABRICKS_SECRET_KEY_NOTION_COOKIE "
+            "(secret must exist in that scope).\n"
             f"{e}"
         )
         return 1
@@ -181,6 +200,14 @@ def run_pipeline() -> int:
     )
 
     _stderr(f"Parsed {len(rows)} row(s); space={NOTION_SPACE_ID} period_ms=({ps}, {pe})")
+
+    if csv_path:
+        try:
+            write_csv_rows(rows, csv_path)
+            _stderr(f"Wrote CSV to {csv_path}.")
+        except OSError as e:
+            _stderr(f"CSV write failed: {e}\n{traceback.format_exc()}")
+            return 1
 
     if delta_table:
         try:
