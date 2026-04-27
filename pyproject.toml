@@ -1,0 +1,36 @@
+[project]
+name = "cto-scripts"
+version = "0.1.0"
+description = "Internal scripts and notebooks (e.g. KPI tech)"
+requires-python = ">=3.10"
+dependencies = [
+    "pandas>=2.0",
+    "requests>=2.28",
+    "pytz",
+    "plotly>=5.18",
+    "ipykernel>=6.29",
+    "openpyxl>=3.1",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+]
+
+[project.scripts]
+kpi-tech = "kpi_tech.__main__:main"
+notion-ai-databricks = "notion_ai_usage.databricks_job:main"
+
+[dependency-groups]
+support-ticket-summary = [
+    "anthropic>=0.40",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+]
+
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+support_ticket_summary = ["system_prompt.md"]
