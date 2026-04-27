@@ -1,0 +1,8 @@
+# Pip-install only these on Databricks — NOT the repo root pyproject.toml.
+# Installing the full ``cto-scripts`` package pulls pandas/plotly/openpyxl/etc. and often
+# upgrades or conflicts with libraries bundled in the Databricks Runtime.
+#
+# pandas, numpy, pyspark — use what DBR ships. notion_ai_usage uses pandas from runtime.
+
+pydantic>=2.7,<3
+pydantic-settings>=2.3,<3
